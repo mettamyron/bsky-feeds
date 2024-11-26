@@ -1,3 +1,9 @@
+# @mettamyron's BSKY Feeds
+
+This code is a POSTGRES fork of https://github.com/Bossett/bsky-feeds by Bossett, which was originally a fork of [the official Bluesky feed generator starter kit](https://github.com/bluesky-social/feed-generator). 
+
+👇🏽
+
 # Bossett's little feed collection
 
 This code was originally a fork of https://github.com/bluesky-social/feed-generator - and you can look there for more information about the mechanics of feed generation. In particular - for questions about 'how to publish the feed' from the script in the scripts folder.

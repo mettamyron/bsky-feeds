@@ -1,373 +1,293 @@
-import {
-  Document,
-  Filter,
-  MongoClient,
-  ObjectId,
-  WithoutId,
-  SortDirection,
-} from 'mongodb'
-import dotenv from 'dotenv'
-import { InvalidRequestError } from '@atproto/xrpc-server'
+import pg from 'pg';
+import dotenv from 'dotenv';
+import { InvalidRequestError } from '@atproto/xrpc-server';
 
-dotenv.config()
+dotenv.config();
 
-class dbSingleton {
-  private static instance: dbSingleton | null = null
-  client: MongoClient | null = null
+export class DbSingleton {
+  private pool: pg.Pool;
 
-  constructor(connection_string: string) {
-    this.client = new MongoClient(connection_string)
-    this.init()
-  }
-
-  static getInstance(): dbSingleton {
-    if (dbSingleton.instance === null) {
-      dbSingleton.instance = new dbSingleton(
-        `${process.env.FEEDGEN_MONGODB_CONNECTION_STRING}`,
-      )
-    }
-    return dbSingleton.instance
+  constructor(connectionString: string) {
+    this.pool = new pg.Pool({ connectionString });
+    this.init();
   }
 
   async init() {
-    if (this.client === null) throw new Error('DB Cannot be null')
-    await this.client.connect()
-  }
-
-  async deleteManyURI(collection: string, uris: string[]) {
-    await this.client
-      ?.db()
-      .collection(collection)
-      .deleteMany({ uri: { $in: uris } })
-  }
-
-  async deleteManyDID(collection: string, dids: string[]) {
-    await this.client
-      ?.db()
-      .collection(collection)
-      .deleteMany({ did: { $in: dids } })
-  }
-
-  async replaceOneURI(collection: string, uri: string, data: any) {
-    if (!(typeof data._id === typeof '')) data._id = new ObjectId()
-    else {
-      data._id = new ObjectId(data._id)
-    }
-
+    const client = await this.pool.connect();
     try {
-      await this.client?.db().collection(collection).insertOne(data)
-    } catch (err) {
-      await this.client
-        ?.db()
-        .collection(collection)
-        .replaceOne({ uri: uri }, data)
+      await this.createTables(client);
+      await this.createIndexes(client);
+    } finally {
+      client.release();
     }
   }
 
-  async replaceOneDID(collection: string, did: string, data: any) {
-    if (!(typeof data._id === typeof '')) data._id = new ObjectId()
-    else {
-      data._id = new ObjectId(data._id)
-    }
+  private async createTables(client: pg.PoolClient) {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS post (
+        id SERIAL PRIMARY KEY,
+        uri TEXT UNIQUE NOT NULL,
+        cid TEXT NOT NULL,
+        author TEXT NOT NULL,
+        text TEXT NOT NULL,
+        reply_parent TEXT,
+        reply_root TEXT,
+        indexed_at BIGINT NOT NULL,
+        has_image BOOLEAN NOT NULL,
+        embed JSONB,
+        algo_tags TEXT[],
+        labels TEXT[]
+      );
 
+      CREATE TABLE IF NOT EXISTS sub_state (
+        id SERIAL PRIMARY KEY,
+        service TEXT UNIQUE NOT NULL,
+        cursor BIGINT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS list_members (
+        id SERIAL PRIMARY KEY,
+        did TEXT UNIQUE NOT NULL
+      );
+    `);
+  }
+
+  private async createIndexes(client: pg.PoolClient) {
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_post_uri ON post(uri);
+      CREATE INDEX IF NOT EXISTS idx_post_indexed_at_cid ON post(indexed_at DESC, cid DESC);
+      CREATE INDEX IF NOT EXISTS idx_post_algo_tags ON post USING GIN(algo_tags);
+      CREATE INDEX IF NOT EXISTS idx_post_author ON post(author);
+      CREATE INDEX IF NOT EXISTS idx_post_labels ON post USING GIN(labels);
+      CREATE INDEX IF NOT EXISTS idx_post_embed_images ON post((embed->'images'));
+      CREATE INDEX IF NOT EXISTS idx_post_embed_media ON post((embed->'media'));
+    `);
+  }
+
+  async deleteAll(table: string) {
+    await this.pool.query(`DELETE FROM ${table}`);
+  }
+
+  async deleteManyURI(table: string, uris: string[]) {
+    await this.pool.query(`DELETE FROM ${table} WHERE uri = ANY($1)`, [uris]);
+  }
+
+  async deleteManyDID(dids: string[]) {
+    await this.pool.query(`DELETE FROM list_members WHERE did = ANY($1)`, [dids]);
+  }
+
+  async replaceOneURI(table: string, uri: string, data: any) {
+    const columns = Object.keys(data);
+    const values = Object.values(data);
+    const placeholders = values.map((_, i) => `$${i + 2}`);
+
+    await this.pool.query(`
+      INSERT INTO ${table} (uri, ${columns.join(', ')})
+      VALUES ($1, ${placeholders.join(', ')})
+      ON CONFLICT (uri) DO UPDATE SET
+      ${columns.map((col, i) => `${col} = $${i + 2}`).join(', ')}
+    `, [uri, ...values]);
+  }
+
+  async replaceManyURI(table: string, data: any[]) {
+    const client = await this.pool.connect();
     try {
-      await this.client?.db().collection(collection).insertOne(data)
-    } catch (err) {
-      await this.client
-        ?.db()
-        .collection(collection)
-        .replaceOne({ did: did }, data)
+      await client.query('BEGIN');
+      for (const item of data) {
+        await this.replaceOneURI(table, item.uri, item);
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
     }
   }
 
-  async getPostBySortWeight(
-    collection: string,
-    limit = 50,
-    cursor: string | undefined = undefined,
-  ) {
-    let start = 0
+  async replaceOneDID(table: string, did: string, data: any) {
+    const columns = Object.keys(data);
+    const values = Object.values(data);
+    const placeholders = values.map((_, i) => `$${i + 2}`);
 
-    if (cursor !== undefined) {
-      start = Number.parseInt(cursor)
-    }
-
-    const posts = await this.client
-      ?.db()
-      .collection(collection)
-      .find({})
-      .sort({ sort_weight: -1 })
-      .skip(start)
-      .limit(limit)
-      .toArray()
-
-    if (posts?.length !== undefined && posts.length > 0) return posts
-    else return []
-  }
-
-  async aggregatePostsByRepliesToCollection(
-    collection: string,
-    tag: string,
-    threshold: number,
-    out: string,
-    limit: number = 10000,
-  ) {
-    const indexedAt = new Date().getTime()
-
-    await this.client
-      ?.db()
-      .collection(collection)
-      .aggregate([
-        { $match: { algoTags: tag, replyRoot: { $ne: null } } },
-        {
-          $group: {
-            _id: '$replyRoot',
-            count: { $sum: 1 },
-          },
-        },
-        { $match: { count: { $gt: threshold } } },
-        { $sort: { count: -1 } },
-        { $limit: limit },
-        { $addFields: { indexedAt: indexedAt } },
-        { $merge: { into: out, on: '_id' } },
-      ])
-      .toArray()
-
-    await this.client
-      ?.db()
-      .collection(out)
-      .deleteMany({ indexedAt: { $ne: indexedAt } })
-  }
-
-  async getCollection(collection: string) {
-    const ret = await this.client
-      ?.db()
-      .collection(collection)
-      .find({})
-      .toArray()
-    if (ret) return ret
-    else return []
-  }
-
-  async insertOrReplaceRecord(
-    query: Filter<Document>,
-    data: WithoutId<Document>,
-    collection: string,
-  ) {
-    try {
-      await this.client?.db().collection(collection).insertOne(data)
-    } catch (err) {
-      await this.client?.db().collection(collection).replaceOne(query, data)
-    }
+    await this.pool.query(`
+      INSERT INTO ${table} (did, ${columns.join(', ')})
+      VALUES ($1, ${placeholders.join(', ')})
+      ON CONFLICT (did) DO UPDATE SET
+      ${columns.map((col, i) => `${col} = $${i + 2}`).join(', ')}
+    `, [did, ...values]);
   }
 
   async updateSubStateCursor(service: string, cursor: number) {
-    await this.client
-      ?.db()
-      .collection('sub_state')
-      .findOneAndReplace(
-        { service: service },
-        { service: service, cursor: cursor },
-        { upsert: true },
-      )
+    await this.pool.query(`
+      INSERT INTO sub_state (service, cursor)
+      VALUES ($1, $2)
+      ON CONFLICT (service) DO UPDATE SET cursor = $2
+    `, [service, cursor]);
   }
 
   async getSubStateCursor(service: string) {
-    const res = await this.client
-      ?.db()
-      .collection('sub_state')
-      .findOne({ service: service })
-    if (res === null) return { service: service, cursor: 0 }
-    return res
+    const result = await this.pool.query('SELECT * FROM sub_state WHERE service = $1', [service]);
+    return result.rows[0];
   }
 
-  async getLatestPostsForTag({
-    tag,
+  async getLatestPostsForTag(
+    tag: string,
     limit = 50,
-    cursor = undefined,
-    mediaOnly = false,
-    nsfwOnly = false,
-    excludeNSFW = false,
-    sortOrder = -1,
-  }: {
-    tag: string
-    limit?: number
-    cursor?: string | undefined
-    mediaOnly?: boolean
-    nsfwOnly?: boolean
-    excludeNSFW?: boolean
-    sortOrder?: SortDirection
-  }) {
-    let query: { indexedAt?: any; cid?: any; algoTags: string; $and?: any[] } =
-      {
-        algoTags: tag,
-      }
+    cursor: string | undefined = undefined,
+    imagesOnly: boolean = false,
+    nsfwOnly: boolean = false,
+    excludeNSFW: boolean = false,
+    authors: string[] = [],
+  ) {
+    let query = `
+      SELECT * FROM post
+      WHERE $1 = ANY(algo_tags)
+    `;
+    const params: any[] = [tag];
+    let paramIndex = 2;
 
-    const conditions: any[] = []
-
-    if (mediaOnly) {
-      conditions.push({
-        $or: [
-          { 'embed.images': { $ne: null } },
-          { 'embed.video': { $ne: null } },
-          { 'embed.media': { $ne: null } },
-        ],
-      })
-    }
     if (nsfwOnly) {
-      conditions.push({
-        labels: {
-          $in: ['porn', 'nudity', 'sexual', 'underwear'],
-          $ne: null,
-        },
-      })
+      query += ` AND labels && $${paramIndex}`;
+      params.push(['porn', 'nudity', 'sexual', 'underwear']);
+      paramIndex++;
     }
+
     if (excludeNSFW) {
-      conditions.push({
-        labels: {
-          $nin: ['porn', 'nudity', 'sexual', 'underwear'],
-          $ne: null,
-        },
-      })
+      query += ` AND NOT (labels && $${paramIndex})`;
+      params.push(['porn', 'nudity', 'sexual', 'underwear']);
+      paramIndex++;
+    }
+
+    if (authors.length > 0) {
+      query += ` AND author = ANY($${paramIndex})`;
+      params.push(authors);
+      paramIndex++;
     }
 
     if (cursor !== undefined) {
-      const [indexedAt, cid] = cursor.split('::')
+      const [indexedAt, cid] = cursor.split('::');
       if (!indexedAt || !cid) {
-        throw new InvalidRequestError('malformed cursor')
+        throw new InvalidRequestError('malformed cursor');
       }
-      const timeStr = new Date(parseInt(indexedAt, 10)).getTime()
-
-      query['indexedAt'] = { $lte: timeStr }
-      query['cid'] = { $ne: cid }
+      query += ` AND (indexed_at < $${paramIndex} OR (indexed_at = $${paramIndex} AND cid < $${paramIndex + 1}))`;
+      params.push(parseInt(indexedAt, 10), cid);
+      paramIndex += 2;
     }
 
-    if (conditions.length > 0) {
-      query.$and = conditions
-    }
+    query += ` ORDER BY indexed_at DESC, cid DESC LIMIT $${paramIndex}`;
+    params.push(limit);
 
-    const results = this.client
-      ?.db()
-      .collection('post')
-      .find(query)
-      .sort({
-        earliestCreatedIndexedAt: sortOrder,
-        createdAt: sortOrder,
-        indexedAt: sortOrder,
-        cid: -1,
-      })
-      .limit(limit)
-      .toArray()
-
-    if (results === undefined) return []
-    else return results
+    const result = await this.pool.query(query, params);
+    return result.rows;
   }
 
   async getTaggedPostsBetween(tag: string, start: number, end: number) {
-    const larger = start > end ? start : end
-    const smaller = start > end ? end : start
+    const larger = Math.max(start, end);
+    const smaller = Math.min(start, end);
 
-    const results = this.client
-      ?.db()
-      .collection('post')
-      .find({ indexedAt: { $lt: larger, $gt: smaller }, algoTags: tag })
-      .sort({ indexedAt: -1, cid: -1 })
-      .toArray()
+    const result = await this.pool.query(`
+      SELECT * FROM post
+      WHERE indexed_at > $1 AND indexed_at < $2 AND $3 = ANY(algo_tags)
+      ORDER BY indexed_at DESC, cid DESC
+    `, [smaller, larger, tag]);
 
-    if (results === undefined) return []
-    else return results
+    return result.rows;
   }
 
-  async getUnlabelledPostsWithMedia(limit = 100, lagTime = 5 * 60 * 1000) {
-    const results = this.client
-      ?.db()
-      .collection('post')
-      .find({
-        $or: [
-          { 'embed.images': { $ne: null } },
-          { 'embed.video': { $ne: null } },
-          { 'embed.media': { $ne: null } },
-        ],
-        labels: null,
-        indexedAt: { $lt: new Date().getTime() - lagTime },
-      })
-      .sort({ indexedAt: -1, cid: -1 })
-      .limit(limit)
-      .toArray()
-
-    return results || []
-  }
-
-  async updateLabelsForURIs(postEntries: { uri: string; labels: string[] }[]) {
-    for (let i = 0; i < postEntries.length; i++) {
-      this.client
-        ?.db()
-        .collection('post')
-        .findOneAndUpdate(
-          { uri: { $eq: postEntries[i].uri } },
-          { $set: { labels: postEntries[i].labels } },
-        )
-    }
-  }
-
-  async getRecentAuthorsForTag(tag: string, lastMs: number = 600000) {
-    const results = await this.client
-      ?.db()
-      .collection('post')
-      .distinct('author', {
-        indexedAt: { $gt: new Date().getTime() - lastMs },
-        algoTags: tag,
-      })
-
-    if (results === undefined) return []
-    else return results
-  }
-
-  async getDistinctFromCollection(collection: string, field: string) {
-    const results = await this.client
-      ?.db()
-      .collection(collection)
-      .distinct(field)
-    if (results === undefined) return []
-    else return results
+  async getDistinctFromCollection(table: string, field: string) {
+    const result = await this.pool.query(`SELECT DISTINCT ${field} FROM ${table}`);
+    return result.rows.map(row => row[field]);
   }
 
   async removeTagFromPostsForAuthor(tag: string, authors: string[]) {
-    const pullQuery: Record<string, any> = { algoTags: { $in: [tag] } }
-    await this.client
-      ?.db()
-      .collection('post')
-      .updateMany({ author: { $in: authors } }, { $pull: pullQuery })
+    await this.pool.query(`
+      UPDATE post
+      SET algo_tags = array_remove(algo_tags, $1)
+      WHERE author = ANY($2)
+    `, [tag, authors]);
 
-    await this.deleteUntaggedPosts()
+    await this.deleteUntaggedPosts();
   }
 
   async removeTagFromOldPosts(tag: string, indexedAt: number) {
-    const pullQuery: Record<string, any> = { algoTags: { $in: [tag] } }
-    await this.client
-      ?.db()
-      .collection('post')
-      .updateMany({ indexedAt: { $lt: indexedAt } }, { $pull: pullQuery })
+    await this.pool.query(`
+      UPDATE post
+      SET algo_tags = array_remove(algo_tags, $1)
+      WHERE indexed_at < $2
+    `, [tag, indexedAt]);
 
-    await this.deleteUntaggedPosts()
+    await this.deleteUntaggedPosts();
+  }
+
+  async getUnlabelledPostsWithMedia(limit = 100, lagTime = 60 * 1000) {
+    const result = await this.pool.query(`
+      SELECT * FROM post
+      WHERE (embed->'images' IS NOT NULL OR embed->'media' IS NOT NULL)
+      AND labels IS NULL
+      AND indexed_at < $1
+      ORDER BY indexed_at DESC, cid DESC
+      LIMIT $2
+    `, [new Date().getTime() - lagTime, limit]);
+
+    return result.rows;
+  }
+
+  async updateLabelsForURIs(postEntries: { uri: string; labels: string[] }[]) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const entry of postEntries) {
+        await client.query(`
+          UPDATE post
+          SET labels = $1
+          WHERE uri = $2
+        `, [entry.labels, entry.uri]);
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 
   async deleteUntaggedPosts() {
-    await this.client
-      ?.db()
-      .collection('post')
-      .deleteMany({ algoTags: { $size: 0 } })
+    await this.pool.query(`DELETE FROM post WHERE array_length(algo_tags, 1) IS NULL`);
+  }
+
+  async deleteSqueakyCleanPosts() {
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+  
+    await this.pool.query(`
+      DELETE FROM post
+      WHERE 'squeaky-clean' = ANY(algo_tags)
+      AND NOT ('mutuals-ad' = ANY(algo_tags))
+      AND created_at < $1
+    `, [fiveMinutesAgo]);
   }
 
   async getPostForURI(uri: string) {
-    const results = await this.client
-      ?.db()
-      .collection('post')
-      .findOne({ uri: uri })
-    if (results === undefined) return null
-    return results
+    const result = await this.pool.query('SELECT * FROM post WHERE uri = $1', [uri]);
+    return result.rows[0] || null;
+  }
+
+  async aggregatePostsByRepliesToCollection(collection: string, limit: number = 100) {
+    const result = await this.pool.query(`
+      SELECT reply_parent, COUNT(*) as reply_count
+      FROM post
+      WHERE reply_parent IS NOT NULL
+      GROUP BY reply_parent
+      ORDER BY reply_count DESC
+      LIMIT $1
+    `, [limit]);
+
+    return result.rows;
   }
 }
 
-const dbClient = dbSingleton.getInstance()
+const dbClient = new DbSingleton(process.env.FEEDGEN_POSTGRES_CONNECTION_STRING || '');
 
-export default dbClient
+export default dbClient;
+
